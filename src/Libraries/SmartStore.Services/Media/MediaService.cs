@@ -481,6 +481,15 @@ namespace SmartStore.Services.Media
             return pathData;
         }
 
+        private void DeleteDupeFileInTrash(MediaFile dupe)
+        {
+            // A soft-deleted file cannot be a dupe. We gonna delete it once and for all.
+            using (new DbContextScope(ctx: _fileRepo.Context, autoCommit: true))
+            {
+                DeleteFile(dupe, true);
+            }
+        }
+
         protected Stream ProcessFile(
             ref MediaFile file, 
             MediaPathData pathData, 
@@ -490,15 +499,25 @@ namespace SmartStore.Services.Media
         {
             if (file != null)
             {
-                if (dupeFileHandling == DuplicateFileHandling.ThrowError)
+                if (file.Deleted)
                 {
-                    throw _exceptionFactory.DuplicateFile(pathData.FullPath, ConvertMediaFile(file));
+                    DeleteDupeFileInTrash(file);
+                    file = null;
                 }
-                else if (dupeFileHandling == DuplicateFileHandling.Rename)
+                else
                 {
-                    if (CheckUniqueFileName(pathData))
+                    if (dupeFileHandling == DuplicateFileHandling.ThrowError)
                     {
-                        file = null;
+                        var fullPath = pathData.FullPath;
+                        CheckUniqueFileName(pathData);
+                        throw _exceptionFactory.DuplicateFile(fullPath, ConvertMediaFile(file, pathData.Folder), pathData.FullPath);
+                    }
+                    else if (dupeFileHandling == DuplicateFileHandling.Rename)
+                    {
+                        if (CheckUniqueFileName(pathData))
+                        {
+                            file = null;
+                        }
                     }
                 }
             }
@@ -641,7 +660,8 @@ namespace SmartStore.Services.Media
                 DuplicateFileHandling = dupeFileHandling,
                 SourceFile = mediaFile,
                 DestinationFile = ConvertMediaFile(copy, destPathData.Folder),
-                IsDuplicate = isDupe
+                IsDuplicate = isDupe,
+                UniquePath = isDupe ? destPathData.FullPath : (string)null
             };
         }
 
@@ -659,26 +679,34 @@ namespace SmartStore.Services.Media
             var dupe = dupeFileSelector();
             if (dupe != null)
             {
-                switch (dupeEntryHandling)
+                if (dupe.Deleted)
                 {
-                    case DuplicateEntryHandling.Skip:
-                        isDupe = true;
-                        return dupe;
-                    case DuplicateEntryHandling.ThrowError:
-                        throw _exceptionFactory.DuplicateFile(destPathData.FullPath, ConvertMediaFile(dupe));
-                    case DuplicateEntryHandling.Rename:
-                        uniqueFileNameChecker(destPathData);
-                        if (dupe == file)
-                        {
+                    DeleteDupeFileInTrash(dupe);
+                    dupe = null;
+                }
+                else
+                {
+                    switch (dupeEntryHandling)
+                    {
+                        case DuplicateEntryHandling.Skip:
+                            isDupe = true;
+                            uniqueFileNameChecker(destPathData);
+                            return dupe;
+                        case DuplicateEntryHandling.ThrowError:
+                            var fullPath = destPathData.FullPath;
+                            uniqueFileNameChecker(destPathData);
+                            throw _exceptionFactory.DuplicateFile(fullPath, ConvertMediaFile(dupe), destPathData.FullPath);
+                        case DuplicateEntryHandling.Rename:
+                            uniqueFileNameChecker(destPathData);
                             dupe = null;
-                        }
-                        break;
-                    case DuplicateEntryHandling.Overwrite:
-                        if (file.FolderId == destPathData.Folder.Id)
-                        {
-                            throw new IOException(T("Admin.Media.Exception.Overwrite"));
-                        }
-                        break;
+                            break;
+                        case DuplicateEntryHandling.Overwrite:
+                            if (file.FolderId == destPathData.Folder.Id)
+                            {
+                                throw new IOException(T("Admin.Media.Exception.Overwrite"));
+                            }
+                            break;
+                    }
                 }
             }
 
@@ -690,6 +718,9 @@ namespace SmartStore.Services.Media
 
             // Set folder id
             copy.FolderId = destPathData.Folder.Id;
+
+            // A copied file cannot stay in deleted state
+            copy.Deleted = false;
 
             // Set name stuff
             if (!copy.Name.IsCaseInsensitiveEqual(destPathData.FileName))
@@ -721,6 +752,7 @@ namespace SmartStore.Services.Media
         private void InternalCopyFileData(MediaFile file, MediaFile copy)
         {
             _storageProvider.Save(copy, _storageProvider.OpenRead(file));
+            _imageCache.Delete(copy);
 
             using (var scope = new DbContextScope(_fileRepo.Context, autoCommit: false))
             {
@@ -765,6 +797,9 @@ namespace SmartStore.Services.Media
             if (ValidateMoveOperation(file, destinationFileName, dupeFileHandling, out var nameChanged, out var destPathData))
             {
                 file.FolderId = destPathData.Folder.Id;
+
+                // A moved file cannot stay in deleted state
+                file.Deleted = false;
 
                 if (nameChanged)
                 {
@@ -821,21 +856,31 @@ namespace SmartStore.Services.Media
             var dupe = _fileRepo.Table.FirstOrDefault(x => x.Name == destFileName && x.FolderId == destFolderId);
             if (dupe != null)
             {
-                switch (dupeFileHandling)
+                if (dupe.Deleted)
                 {
-                    case DuplicateFileHandling.ThrowError:
-                        throw _exceptionFactory.DuplicateFile(destPathData.FullPath, ConvertMediaFile(dupe, destPathData.Folder));
-                    case DuplicateFileHandling.Rename:
-                        if (InternalCheckUniqueFileName(destPathData.FileTitle, destPathData.Extension, dupe.Name, out var uniqueName))
-                        {
-                            nameChanged = true;
-                            destPathData.FileName = uniqueName;
-                            return true;
-                        }
-                        break;
-                    case DuplicateFileHandling.Overwrite:
-                        DeleteFile(dupe, true);
-                        break;
+                    DeleteDupeFileInTrash(dupe);
+                    dupe = null;
+                }
+                else
+                {
+                    switch (dupeFileHandling)
+                    {
+                        case DuplicateFileHandling.ThrowError:
+                            var fullPath = destPathData.FullPath;
+                            InternalCheckUniqueFileName(destPathData.FileTitle, destPathData.Extension, dupe.Name, out _);
+                            throw _exceptionFactory.DuplicateFile(fullPath, ConvertMediaFile(dupe, destPathData.Folder), destPathData.FullPath);
+                        case DuplicateFileHandling.Rename:
+                            if (InternalCheckUniqueFileName(destPathData.FileTitle, destPathData.Extension, dupe.Name, out var uniqueName))
+                            {
+                                nameChanged = true;
+                                destPathData.FileName = uniqueName;
+                                return true;
+                            }
+                            break;
+                        case DuplicateFileHandling.Overwrite:
+                            DeleteFile(dupe, true);
+                            break;
+                    }
                 }
             }
 

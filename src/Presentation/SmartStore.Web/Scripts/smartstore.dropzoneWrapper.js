@@ -24,7 +24,8 @@
 	var assignableFileIds = "";
 	var activeFiles = 0;
 	var canUploadMoreFiles = true;	// TODO: investigate!!! This can be done better.
-	var dupeFileHandlerDisplayFile;
+	var dialog = SmartStore.Admin.Media.fileConflictResolutionDialog;
+	var file;
 
 	$.fn.dropzoneWrapper = function (options) {
 		return this.each(function () {
@@ -97,6 +98,7 @@
 			if (!displayPreviewInList && options.maxFiles > 1) {
 				previewContainer.sortable({
 					items: fuContainer.find('.dz-image-preview'),
+					handle: '.fu-file-dragarea',
 					ghostClass: 'sortable-ghost',
 					animation: 150
 				}).on('sort', function (e, ui) {
@@ -128,11 +130,15 @@
 				if (Array.isArray(files))
 					activeFiles = files.filter(file => file.accepted === true).length;
 
+				// Reset former decision (maybe better placed in onCompletedHandler)
+				fuContainer.data("resolution-type", "");
+
 				// Status
 				if (elStatusWindow.length > 0) {
 					elStatusWindow.find(".current-file-count").text(files.length);
 					elStatusWindow.find(".current-file-text").text(Res['FileUploader.StatusWindow.Uploading.File' + (files.length === 1 ? "" : "s")]);
 					elStatusWindow.find(".flyout-commands").addClass("show");
+					elStatusWindow.attr("data-upload-in-progress", true);
 				}
 			});
 
@@ -153,7 +159,7 @@
 				logEvent("sending", file, xhr, formData);
 
 				// Write user decision of duplicate handling into formdata before sending so it'll be sent to the server with each file upload.
-				var enumId = fuContainer.data("dupe-handling-type");
+				var enumId = fuContainer.data("resolution-type");
 				if (enumId) {
 					formData.append("duplicateFileHandling", enumId);
 				}
@@ -164,7 +170,7 @@
 					if (formData.has("typeFilter"))
 						formData.delete("typeFilter");
 
-					for (type of $el.data('type-filter').split(",")) {
+					for (var type of $el.data('type-filter').split(",")) {
 						formData.append("typeFilter", type);
 					}
 				}
@@ -239,6 +245,9 @@
 			el.on("successmultiple", function (files, response, progress) {
 				logEvent("successmultiple", files, response, progress);
 
+				if (opts.maxFiles === 1)
+					return;
+
 				if (response.length) {
 					$.each(response, function (i, value) {
 						assignableFileIds += value.id + ",";
@@ -264,7 +273,7 @@
 					this.removeAllFiles(true); 
 				}
 
-				if (options.onUploadCompleted) options.onUploadCompleted.apply(this, [file]);
+				//if (options.onUploadCompleted) options.onUploadCompleted.apply(this, [file]);
 			});
 
 			el.on("completemultiple", function (files) {
@@ -275,7 +284,7 @@
 					.filter(file => file.media && file.media.dupe === true);
 
 				// Dupe file handling is 'replace' thus no need for assignment to entity (media IDs remain the same, while file was altered). 
-				if (fuContainer.data("dupe-handling-type") === 1) {
+				if (fuContainer.data("resolution-type") === 1) {
 					// Update preview pic of replaced media file.
                     for (var newFile of files) {
                         var elCurrentFile = previewContainer.find(".dz-image-preview[data-media-id='" + newFile.media.id + "']");
@@ -309,12 +318,20 @@
 				var successFiles = this.getFilesWithStatus(Dropzone.SUCCESS);
 
 				// If there are duplicates & dialog isn't already open > open duplicate file handler dialog.
-				if (dupeFiles.length !== 0 && !$("#duplicate-window").hasClass("show")) {
-					dupeFileHandlerDisplayFile = SmartStore.Admin.Media.openDupeFileHandlerDialog(
-						dupeFileHandlerCallback,		
-						elDropzone.find(".fileupload").attr("id"),
-						dupeFiles[0] // Pass first duplicate file to be displayed in dialog.
-					);
+				if (dupeFiles.length !== 0 && !dialog.isOpen) {
+
+					// Close confirmation dialog. User was to slow. Uploads are complete.
+					if (elStatusWindow.data("confirmation-requested")) {
+						$("#modal-confirm-shared").modal("hide");
+					}
+
+					// Open duplicate file handler dialog.
+					dialog.open({
+						queue: SmartStore.Admin.Media.convertDropzoneFileQueue(dupeFiles),
+						callerId: elDropzone.find(".fileupload").attr("id"),
+						onResolve: dupeFileHandlerCallback,
+						onComplete: dupeFileHandlerCompletedCallback
+					});
 				}
 
 				updateUploadStatus(this, elStatus);
@@ -324,6 +341,7 @@
 					elStatusWindow.find(".current-file-count").text(successFiles.length);
 					elStatusWindow.find(".current-file-text").text(Res['FileUploader.StatusWindow.Complete.File' + (successFiles.length === 1 ? "" : "s")]);
 					elStatusWindow.find(".flyout-commands").removeClass("show");
+					elStatusWindow.attr("data-upload-in-progress", false);
 				}
 
 				// Reset progressbar when queue is complete.
@@ -334,6 +352,7 @@
 				else if (!displayPreviewInList || (displayPreviewInList && dupeFiles.length !== 0)) {		// Don't reset progress bar for status window if dupefiles = 0
 					// MultiFile
 					var uploadedFiles = this.files;
+					
 					for (file of uploadedFiles) {
 						// Only reset progress bar if there was an error (file is dupe) and the files must be processed again.
 						if (file.status === Dropzone.ERROR) {
@@ -450,9 +469,9 @@
 										.attr("data-media-id", value.MediaFileId)
 										.attr("data-media-name", value.Name)
 										.attr("data-entity-media-id", value.ProductMediaFileId)
-										.attr("data-original-title", '<div class="text-left px-3"><em>' + file.name + '</em> <br/> <b>' + el.filesize(file.size) + '</b></div>')
-										.removeClass("d-none")
-										.tooltip();
+										.removeClass("d-none");
+
+									elPreview.find(".fu-file-info-name").html(file.name);
 
                                     elPreview
                                         .find('img')
@@ -596,10 +615,25 @@
 				cancelAllUploads(true);
 			});
 
+			elStatusWindow.on('uploadresumed', function (e) {
+				var dupeFiles = el.getFilesWithStatus(Dropzone.ERROR)
+					.filter(file => file.media && file.media.dupe === true);
+
+				// TODO: DRY > make function and pass dupeFiles as param
+				if (dupeFiles.length !== 0 && !dialog.isOpen) {
+					dialog.open({
+						queue: SmartStore.Admin.Media.convertDropzoneFileQueue(dupeFiles),
+						callerId: elDropzone.find(".fileupload").attr("id"),
+						onResolve: dupeFileHandlerCallback,
+						onComplete: dupeFileHandlerCompletedCallback
+					});
+				}
+			});
+
 			function cancelAllUploads(removeFiles) {
 
 				var currentlyUploading = el.getFilesWithStatus(Dropzone.QUEUED);
-
+				
 				// Add currently uploading file to queued files.
 				currentlyUploading.push(el.getFilesWithStatus(Dropzone.UPLOADING)[0]);
 
@@ -608,12 +642,16 @@
 					elStatusWindow.find(".current-file-count").text(currentlyUploading.length);
 					elStatusWindow.find(".current-file-text").text(Res['FileUploader.StatusWindow.Canceled.File' + (currentlyUploading.length === 1 ? "" : "s")]);
 					elStatusWindow.find(".flyout-commands").removeClass("show");
+					elStatusWindow.data("data-upload-in-progress", false);
 				}
 				else {
 					$(this).hide();
 				}
 
 				for (file of currentlyUploading) {
+					if (!file)
+						return;
+
 					if (removeFiles) {
 						el.removeFile(file);
 						//el.cancelUpload(file);
@@ -622,8 +660,15 @@
 						file.status = Dropzone.CANCELED;
 						var template = $(file.previewTemplate);
 						template.addClass("canceled");
+
+						/*
 						var icon = template.find(".upload-status > i");
-						icon.removeClass("d-none").addClass("fa-times text-danger");
+						icon.removeClass("d-none").addClass("fa-times-circle text-danger");
+						*/
+
+						var icon = template.find(".upload-status > .fu-item-canceled");
+						icon.removeClass("d-none");
+
 						template.find(".circular-progress").remove();
 					}
 				}
@@ -641,7 +686,6 @@
 					el.removeAllFiles();
 				}
 			});
-			
 		});
 	};
 
@@ -680,30 +724,33 @@
 	});
 
 	// Callback function for duplicate file handling dialog.
-	function dupeFileHandlerCallback(dupeFileHandlingType, saveSelection, callerId) {
-		var duplicateDialog = $("#duplicate-window");
-		var fileuploadContainer = $("#" + callerId).closest(".fileupload-container");
-		var dropzone = Dropzone.forElement(fileuploadContainer[0]);
+	function dupeFileHandlerCallback(resolutionType, remainingFiles) {
+		var fuContainer = $("#" + this.callerId).closest(".fileupload-container");
+		var dropzone = Dropzone.forElement(fuContainer[0]);
 		var errorFiles = dropzone.getFilesWithStatus(Dropzone.ERROR);
-		var displayPreviewInList = fileuploadContainer.find(".preview-container").data("display-list-items");
+		var displayPreviewInList = fuContainer.find(".preview-container").data("display-list-items");
+		var resumeUpload = false;
+		var applyToRemaining = remainingFiles.length > 1;
+		// Store user decision where it can be accessed by other events (e.g. dropzone > sending).
+		fuContainer.data("resolution-type", resolutionType);
 
 		// Get all duplicate files.
 		var dupeFiles = errorFiles.filter(file => file.media && file.media.dupe === true);
 
-		if (!saveSelection) {
+		if (!applyToRemaining) {
 			var firstFile = dupeFiles[0];
-			firstFile.dupeHandlingType = dupeFileHandlingType;
+			firstFile.resolutionType = resolutionType;
 
 			// Do nothing on skip.
-			if (dupeFileHandlingType === "0") {
+			if (resolutionType === "0") {
 				dropzone.removeFile(firstFile);
 
 				if (dupeFiles[1]) {
-					dupeFileHandlerDisplayFile.file = dupeFiles[1];
+					dialog.next();
 				}
 				else {
 					dropzone.emit("queuecomplete");
-					duplicateDialog.modal('hide');
+					dialog.close();
 				}
 
 				return;
@@ -714,29 +761,27 @@
 
 			// Process first file. 
 			dropzone.processFile(firstFile);
+			resumeUpload = displayPreviewInList;
 
 			// If current file is last file > close dialog else display next file.
 			if (dupeFiles.length === 1) {
-				duplicateDialog.modal('hide');
+				dialog.close();
 			}
 			else {
-				dupeFileHandlerDisplayFile.file = dupeFiles[1];
+				dialog.next();
 			}
-
-			// And leave.
-			return;
 		}
 		else {
 			// Reset file status.
 			for (file of dupeFiles) {
 				resetFileStatus(file);
-				file.dupeHandlingType = dupeFileHandlingType;
+				file.resolutionType = resolutionType;
 			}
 
 			// Do nothing on skip.
-			if (dupeFileHandlingType === "0") {
+			if (resolutionType === "0") {
 				dropzone.emit("queuecomplete");
-				duplicateDialog.modal('hide');
+				dialog.close();
 				return;
 			}
 
@@ -750,13 +795,29 @@
 					dropzone.processFile(file);
 				}
 
-				// Files are being uplodad again. So display cancel bar again.
-				$(".fu-status-window").find(".flyout-commands").addClass("show");
+				resumeUpload = true;
 			}
-			
-			duplicateDialog.modal('hide');
 
-			return;
+			dialog.close();
+		}
+
+		if (resumeUpload) {
+			// Files are being uplodad again. So display cancel bar again.
+			$(".fu-status-window")
+				.attr("data-upload-in-progress", true)
+				.find(".flyout-commands")
+				.addClass("show");
+		}
+
+		return;
+	}
+
+	function dupeFileHandlerCompletedCallback(isCanceled) {
+		if (isCanceled) {
+			// All pending files must be removed from dropzone.
+			var fuContainer = $("#" + this.callerId).closest(".fileupload-container");
+			var dropzone = Dropzone.forElement(fuContainer[0]);
+			dropzone.removeAllFiles();
 		}
 	}
 
@@ -765,11 +826,9 @@
 		//fuContainer.find('.fileupload-filesize').html(this.filesize(file.size));
 		fuContainer.find('.fileupload-thumb').css('background-image', 'url("' + file.thumbUrl + '")');
 
+		var id = file.downloadId ? file.downloadId : file.id;
 		// TODO: .find('.hidden') doesn't seems safe. Do it better.
-		if (file.downloadId)
-			fuContainer.find('.hidden').val(file.downloadId).trigger('change');
-		else
-			fuContainer.find('.hidden').val(file.id).trigger('change');
+		fuContainer.find('.hidden').val(id).trigger('change');
 
 		if (options.showRemoveButtonAfterUpload)
 			fuContainer.find('.remove').show();
@@ -818,9 +877,9 @@
 		}
 
 		// Renamed, replaced, skipped.
-		var skippedFiles = dropzone.files.filter(file => file.dupeHandlingType === "0");
-		var replacedFiles = dropzone.files.filter(file => file.dupeHandlingType === "1");
-		var renamedFiles = dropzone.files.filter(file => file.dupeHandlingType === "2");
+		var skippedFiles = dropzone.files.filter(file => file.resolutionType === "0");
+		var replacedFiles = dropzone.files.filter(file => file.resolutionType === "1");
+		var renamedFiles = dropzone.files.filter(file => file.resolutionType === "2");
 
 		fillStatusList(skippedFiles, elStatus.find(".skipped-files"));
 		fillStatusList(renamedFiles, elStatus.find(".renamed-files"));
@@ -829,8 +888,8 @@
 
 	function fillStatusList(files, elList) {
 		if (files.length > 0) {
-
 			var markUp = "";
+
 			for (file of files) {
 				markUp += "<div><span>" + file.name + "</span></div>";
 			}
